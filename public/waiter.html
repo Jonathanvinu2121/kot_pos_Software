@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>KOT POS - Waiter Terminal</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="shared.js"></script>
+</head>
+<body>
+
+  <!-- Login Panel -->
+  <div id="login-panel" class="login-container" style="display: none;">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="login-logo">KOT POS</div>
+        <div class="login-subtitle">Waiter Terminal Authentication</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Name or User ID</label>
+        <input type="text" id="login-name" class="form-input" placeholder="e.g. Rajesh Kumar or 1">
+      </div>
+      <div class="form-group">
+        <label class="form-label">PIN</label>
+        <input type="password" id="login-pin" class="form-input" placeholder="••••">
+      </div>
+      <button class="btn" id="login-submit">Login</button>
+      <div id="login-error" style="color: var(--danger); font-size: 14px; margin-top: 12px; display: none;"></div>
+    </div>
+  </div>
+
+  <!-- Main View -->
+  <div id="main-view" style="display: none;">
+    <div id="header-container"></div>
+    
+    <div class="main-layout">
+      <!-- Tables Sidebar -->
+      <div class="sidebar">
+        <div class="sidebar-title">Tables</div>
+        <div class="table-list" id="tables-container">
+          <!-- Dynamically filled -->
+        </div>
+      </div>
+      
+      <!-- Table Order View -->
+      <div class="content-area" id="order-container">
+        <div class="placeholder-view" id="no-table-placeholder">
+          <div class="placeholder-icon">🍽️</div>
+          <h2>Select a table to manage orders</h2>
+          <p style="margin-top: 8px;">Select from the list on the left to view active orders or create a new one.</p>
+        </div>
+        
+        <div id="active-order-view" style="display: none; flex: 1; display: flex; flex-direction: column;">
+          <div class="order-header">
+            <div>
+              <div class="order-title" id="order-title-text">Table #</div>
+              <div style="font-size: 13px; color: var(--text-muted);">
+                Order ID: <span id="val-order-id" style="font-weight: 500;">-</span> | 
+                Head: <span id="val-order-head" style="font-family: monospace; font-size: 11px;">-</span>
+              </div>
+            </div>
+            <div class="order-actions">
+              <button class="btn btn-success" id="btn-send-kitchen">Send Pending to Kitchen</button>
+              <button class="btn btn-danger" id="btn-cancel-order">Cancel Order</button>
+            </div>
+          </div>
+          
+          <div class="order-grid">
+            <!-- Left: Current Order Items -->
+            <div class="card" style="min-height: 300px;">
+              <div class="card-title">
+                Current Items
+                <span id="order-status-badge" class="item-status-badge badge-pending">open</span>
+              </div>
+              <div class="items-list" id="order-items-list">
+                <!-- Dynamically filled -->
+              </div>
+            </div>
+            
+            <!-- Right: Menu Picker -->
+            <div class="card">
+              <div class="card-title">Add Item to Order</div>
+              <div class="menu-grid" id="menu-items-picker">
+                <!-- Dynamically filled -->
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let socket = null;
+    let selectedTable = null;
+    let activeOrder = null;
+    let menuItems = [];
+    const deviceId = 'waiter-device-' + Math.random().toString(36).substring(2, 9);
+
+    document.addEventListener('DOMContentLoaded', async () => {
+      const user = getCurrentUser();
+      if (!user || user.role !== 'waiter') {
+        document.getElementById('login-panel').style.display = 'flex';
+      } else {
+        document.getElementById('main-view').style.display = 'block';
+        setupHeader('header-container', 'Waiter Terminal');
+        await initApp();
+      }
+
+      // Login handler
+      document.getElementById('login-submit').addEventListener('click', async () => {
+        const pin = document.getElementById('login-pin').value;
+        const credential = document.getElementById('login-name').value;
+        const payload = { pin };
+        
+        if (!isNaN(Number(credential))) {
+          payload.user_id = Number(credential);
+        } else {
+          payload.name = credential;
+        }
+
+        try {
+          const res = await fetch('/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.error || 'Login failed');
+          }
+          const data = await res.json();
+          setAuthToken(data.token);
+          window.location.reload();
+        } catch (e) {
+          const errDiv = document.getElementById('login-error');
+          errDiv.innerText = e.message;
+          errDiv.style.display = 'block';
+        }
+      });
+    });
+
+    async function initApp() {
+      // Connect socket
+      const token = getAuthToken();
+      socket = io({ auth: { token } });
+
+      socket.on('connect', () => {
+        console.log('Connected to socket server');
+      });
+
+      socket.on('order:updated', (updatedOrder) => {
+        console.log('Live order update received via socket:', updatedOrder);
+        // Only update view if it is for the currently selected table's active order
+        if (selectedTable && selectedTable.active_order && selectedTable.active_order.id === updatedOrder.id) {
+          activeOrder = updatedOrder;
+          renderActiveOrder();
+        }
+        // Refresh tables list to show accurate status colors/badges
+        refreshTables();
+      });
+
+      socket.on('connect_error', (err) => {
+        console.error('Socket connect error:', err);
+      });
+
+      // Load items
+      await refreshTables();
+      await loadMenu();
+    }
+
+    async function loadMenu() {
+      try {
+        const res = await apiFetch('/menu');
+        menuItems = await res.json();
+        renderMenu();
+      } catch (e) {
+        console.error('Failed to load menu items', e);
+      }
+    }
+
+    async function refreshTables() {
+      try {
+        const res = await apiFetch('/tables');
+        const tables = await res.json();
+        
+        const container = document.getElementById('tables-container');
+        container.innerHTML = '';
+        
+        tables.forEach(table => {
+          const activeClass = (selectedTable && selectedTable.id === table.id) ? 'active' : '';
+          const tableDiv = document.createElement('div');
+          tableDiv.className = `table-item ${activeClass}`;
+          tableDiv.innerHTML = `
+            <span class="table-num">Table ${table.number}</span>
+            <span class="table-status status-${table.status}">${table.status}</span>
+          `;
+          
+          tableDiv.addEventListener('click', () => {
+            // Leave old table room if any
+            if (selectedTable) {
+              // Note: leaving rooms is handled implicitly or via join_table switching
+            }
+            
+            selectedTable = table;
+            
+            // Highlight selected table
+            document.querySelectorAll('.table-item').forEach(el => el.classList.remove('active'));
+            tableDiv.classList.add('active');
+            
+            // Join new table room
+            socket.emit('join_table', { table_id: table.id });
+            
+            loadTableOrder(table);
+          });
+          
+          container.appendChild(tableDiv);
+        });
+      } catch (e) {
+        console.error('Failed to load tables list', e);
+      }
+    }
+
+    async function loadTableOrder(table) {
+      if (!table.active_order) {
+        activeOrder = null;
+        renderNoOrderView(table);
+      } else {
+        try {
+          const res = await apiFetch(`/orders/${table.active_order.id}`);
+          activeOrder = await res.json();
+          renderActiveOrder();
+        } catch (e) {
+          console.error('Failed to load active order', e);
+          activeOrder = null;
+          renderNoOrderView(table);
+        }
+      }
+    }
+
+    function renderNoOrderView(table) {
+      document.getElementById('no-table-placeholder').style.display = 'none';
+      document.getElementById('active-order-view').style.display = 'flex';
+      
+      document.getElementById('order-title-text').innerText = `Table #${table.number}`;
+      document.getElementById('val-order-id').innerText = 'None';
+      document.getElementById('val-order-head').innerText = 'None';
+      
+      document.getElementById('btn-send-kitchen').style.display = 'none';
+      document.getElementById('btn-cancel-order').style.display = 'none';
+      
+      const orderStatusBadge = document.getElementById('order-status-badge');
+      orderStatusBadge.className = 'item-status-badge badge-pending';
+      orderStatusBadge.innerText = 'available';
+
+      const itemsList = document.getElementById('order-items-list');
+      itemsList.innerHTML = `
+        <div style="text-align: center; padding: 40px 0; color: var(--text-muted);">
+          <p>No active order exists for Table ${table.number}.</p>
+          <button class="btn btn-success" style="margin-top: 16px; width: auto;" onclick="createNewOrder(${table.id})">Create New Order</button>
+        </div>
+      `;
+    }
+
+    async function createNewOrder(tableId) {
+      const user = getCurrentUser();
+      const eventId = crypto.randomUUID();
+      const hlc = generateHLC(deviceId);
+
+      // Create order by pushing event to /sync/push
+      try {
+        const res = await apiFetch('/sync/push', {
+          method: 'POST',
+          body: JSON.stringify({
+            events: [
+              {
+                event_id: eventId,
+                restaurant_id: user.restaurant_id,
+                order_id: Math.floor(Math.random() * 900000) + 100000, // random temp order ID, Postgres will sequence it
+                table_id: tableId,
+                device_id: deviceId,
+                user_id: user.user_id,
+                action: 'CREATE_ORDER',
+                payload: { table_id: tableId },
+                based_on_event_id: null,
+                client_created_at: new Date().toISOString(),
+                hlc: hlc
+              }
+            ]
+          })
+        });
+
+        const outcome = await res.json();
+        console.log('Create order outcome:', outcome);
+
+        if (outcome[0].status === 'applied') {
+          // Success! Reload tables
+          await refreshTables();
+          // Find the table and click it again
+          const refreshedTable = await fetchTableData(tableId);
+          selectedTable = refreshedTable;
+          loadTableOrder(refreshedTable);
+        } else {
+          alert('Failed to create order: ' + outcome[0].message);
+        }
+      } catch (e) {
+        console.error('Failed to create order', e);
+      }
+    }
+
+    async function fetchTableData(tableId) {
+      const res = await apiFetch('/tables');
+      const tables = await res.json();
+      return tables.find(t => t.id === tableId);
+    }
+
+    function renderActiveOrder() {
+      document.getElementById('no-table-placeholder').style.display = 'none';
+      document.getElementById('active-order-view').style.display = 'flex';
+      
+      document.getElementById('order-title-text').innerText = `Table #${selectedTable.number}`;
+      document.getElementById('val-order-id').innerText = activeOrder.id;
+      document.getElementById('val-order-head').innerText = activeOrder.head_event_id || 'None';
+      
+      document.getElementById('btn-send-kitchen').style.display = 'inline-flex';
+      document.getElementById('btn-cancel-order').style.display = 'inline-flex';
+      
+      const badge = document.getElementById('order-status-badge');
+      badge.innerText = activeOrder.status;
+      badge.className = `item-status-badge badge-${activeOrder.status}`;
+      
+      const itemsList = document.getElementById('order-items-list');
+      itemsList.innerHTML = '';
+      
+      if (!activeOrder.order_items || activeOrder.order_items.length === 0) {
+        itemsList.innerHTML = `<div style="text-align: center; padding: 40px 0; color: var(--text-muted);">No items in this order. Select items from the menu to add.</div>`;
+        return;
+      }
+      
+      activeOrder.order_items.forEach(item => {
+        const itemRow = document.createElement('div');
+        itemRow.className = 'item-row';
+        itemRow.innerHTML = `
+          <div class="item-info">
+            <span class="item-name">${item.menu_item.name}</span>
+            <span class="item-notes">${item.notes || ''}</span>
+          </div>
+          <div style="display: flex; align-items: center;">
+            <div class="item-qty-controls">
+              <button class="qty-btn" onclick="updateQty(${item.id}, ${item.qty - 1})">-</button>
+              <span class="qty-val">${item.qty}</span>
+              <button class="qty-btn" onclick="updateQty(${item.id}, ${item.qty + 1})">+</button>
+            </div>
+            <span class="item-status-badge badge-${item.status}">${item.status}</span>
+          </div>
+        `;
+        itemsList.appendChild(itemRow);
+      });
+    }
+
+    function renderMenu() {
+      const container = document.getElementById('menu-items-picker');
+      container.innerHTML = '';
+      
+      menuItems.forEach(item => {
+        const itemDiv = document.createElement('div');
+        itemDiv.className = 'menu-card-item';
+        itemDiv.innerHTML = `
+          <div>
+            <div style="font-weight: 500;">${item.name}</div>
+            <div style="font-size: 12px; color: var(--text-muted);">${item.category}</div>
+          </div>
+          <div class="menu-item-price">$${(item.price_cents / 100).toFixed(2)}</div>
+        `;
+        
+        itemDiv.addEventListener('click', () => addItemToOrder(item));
+        container.appendChild(itemDiv);
+      });
+    }
+
+    // Pushes events through sync channel `/sync/push`
+    async function pushEvent(eventAction, payload) {
+      const user = getCurrentUser();
+      const eventId = crypto.randomUUID();
+      const hlc = generateHLC(deviceId);
+      
+      const event = {
+        event_id: eventId,
+        restaurant_id: user.restaurant_id,
+        order_id: activeOrder.id,
+        table_id: selectedTable.id,
+        device_id: deviceId,
+        user_id: user.user_id,
+        action: eventAction,
+        payload: payload,
+        based_on_event_id: activeOrder.head_event_id,
+        client_created_at: new Date().toISOString(),
+        hlc: hlc
+      };
+
+      try {
+        const res = await apiFetch('/sync/push', {
+          method: 'POST',
+          body: JSON.stringify({ events: [event] })
+        });
+        
+        const outcomeArray = await res.json();
+        const outcome = outcomeArray[0];
+        console.log('Event push outcome:', outcome);
+        
+        if (outcome.status === 'applied') {
+          // Success!
+          // We wait for the socket order:updated to update our screen.
+        } else if (outcome.status === 'soft_conflict') {
+          showToast('Soft Conflict Merged', 'Your changes collided with another waiter\'s update and were merged using Last-Write-Wins.');
+        } else if (outcome.status === 'hard_conflict') {
+          // Blocking conflict modal
+          const decision = await showConflictModal(
+            'Concurrent Order Conflict Detected',
+            'Your edits conflict with another session\'s concurrent updates on this order (e.g. order cancelled or items changed). How would you like to resolve this?',
+            event
+          );
+          
+          // Resolve manual conflict
+          await resolveConflict(eventId, decision);
+        } else if (outcome.status === 'error') {
+          alert('Database Error: ' + outcome.message);
+        }
+      } catch (e) {
+        console.error('Failed to push sync event', e);
+      }
+    }
+
+    async function resolveConflict(eventId, action) {
+      try {
+        const res = await apiFetch('/sync/resolve', {
+          method: 'POST',
+          body: JSON.stringify({ event_id: eventId, action })
+        });
+        const data = await res.json();
+        console.log('Resolve conflict response:', data);
+        showToast('Conflict Resolved', `You successfully chose to ${action} your concurrent changes.`);
+      } catch (e) {
+        console.error('Resolve conflict error', e);
+      }
+    }
+
+    async function addItemToOrder(menuItem) {
+      if (!activeOrder) return;
+      await pushEvent('ADD_ITEM', {
+        menu_item_id: menuItem.id,
+        qty: 1,
+        notes: ''
+      });
+    }
+
+    async function updateQty(itemId, newQty) {
+      if (!activeOrder) return;
+      if (newQty <= 0) {
+        // We can treat this as updating status to cancelled
+        await pushEvent('UPDATE_ITEM_STATUS', {
+          itemId: itemId,
+          status: 'cancelled'
+        });
+      } else {
+        await pushEvent('UPDATE_ITEM_QTY', {
+          itemId: itemId,
+          qty: newQty
+        });
+      }
+    }
+
+    document.getElementById('btn-send-kitchen').addEventListener('click', async () => {
+      if (!activeOrder || !activeOrder.order_items) return;
+      
+      // Find all items with status 'pending'
+      const pendingItems = activeOrder.order_items.filter(item => item.status === 'pending');
+      if (pendingItems.length === 0) {
+        showToast('No Pending Items', 'All items have already been sent to the kitchen.');
+        return;
+      }
+      
+      // We will push one status update event per pending item
+      // To preserve head order sequence, we chain them or push them as one event or sequentially
+      // Wait, we can push them in a batch! Our /sync/push loop processes an array of events!
+      const user = getCurrentUser();
+      const baseHlc = Date.now();
+      let parentHead = activeOrder.head_event_id;
+      
+      const events = pendingItems.map((item, index) => {
+        const eventId = crypto.randomUUID();
+        const event = {
+          event_id: eventId,
+          restaurant_id: user.restaurant_id,
+          order_id: activeOrder.id,
+          table_id: selectedTable.id,
+          device_id: deviceId,
+          user_id: user.user_id,
+          action: 'UPDATE_ITEM_STATUS',
+          payload: { itemId: item.id, status: 'sent_to_kitchen' },
+          based_on_event_id: parentHead,
+          client_created_at: new Date().toISOString(),
+          hlc: `${baseHlc}-${index}-${deviceId}`
+        };
+        parentHead = eventId; // Chain the based_on sequence inside the batch!
+        return event;
+      });
+
+      try {
+        const res = await apiFetch('/sync/push', {
+          method: 'POST',
+          body: JSON.stringify({ events })
+        });
+        const outcomes = await res.json();
+        console.log('Send to kitchen outcomes:', outcomes);
+        
+        const lastOutcome = outcomes[outcomes.length - 1];
+        if (lastOutcome.status === 'applied') {
+          showToast('Sent to Kitchen', 'Pending items successfully sent to the kitchen.');
+        } else if (lastOutcome.status === 'hard_conflict') {
+          const decision = await showConflictModal(
+            'Concurrent Order Conflict Detected',
+            'Your edits conflict with another session\'s concurrent updates on this order.',
+            events[events.length - 1]
+          );
+          await resolveConflict(lastOutcome.event_id, decision);
+        }
+      } catch (e) {
+        console.error('Failed to send to kitchen', e);
+      }
+    });
+
+    document.getElementById('btn-cancel-order').addEventListener('click', async () => {
+      if (!activeOrder) return;
+      if (!confirm('Are you sure you want to cancel this entire order? This action is terminal.')) return;
+      
+      await pushEvent('CANCEL_ORDER', {
+        order_id: activeOrder.id
+      });
+    });
+  </script>
+</body>
+</html>

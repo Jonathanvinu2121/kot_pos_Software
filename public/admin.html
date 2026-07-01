@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>KOT POS - Manager Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="shared.js"></script>
+</head>
+<body>
+
+  <!-- Login Panel -->
+  <div id="login-panel" class="login-container" style="display: none;">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="login-logo">KOT MANAGER</div>
+        <div class="login-subtitle">Dashboard Authentication</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Name or User ID</label>
+        <input type="text" id="login-name" class="form-input" placeholder="e.g. Manager Rahul or 4">
+      </div>
+      <div class="form-group">
+        <label class="form-label">PIN</label>
+        <input type="password" id="login-pin" class="form-input" placeholder="••••">
+      </div>
+      <button class="btn" id="login-submit">Login to Dashboard</button>
+      <div id="login-error" style="color: var(--danger); font-size: 14px; margin-top: 12px; display: none;"></div>
+    </div>
+  </div>
+
+  <!-- Main View -->
+  <div id="main-view" style="display: none;">
+    <div id="header-container"></div>
+    
+    <div class="content-area" style="padding: 24px;">
+      <h2 style="margin-bottom: 24px;">📈 Management Console</h2>
+      
+      <div class="admin-grid">
+        
+        <!-- Left: Conflict Control Room -->
+        <div class="card" style="min-height: 400px; display: flex; flex-direction: column;">
+          <div class="card-title" style="color: var(--warning); display: flex; align-items: center; gap: 8px;">
+            ⚠️ Unresolved Hard Conflicts
+            <span id="conflict-count-badge" style="font-size: 12px; background: var(--warning-glow); padding: 2px 8px; border-radius: 20px; font-weight: 600;">0</span>
+          </div>
+          
+          <div style="flex: 1; overflow-y: auto;" id="conflicts-list-container">
+            <!-- Dynamically populated -->
+          </div>
+        </div>
+        
+        <!-- Right: Event Log & Audit Trail Viewer -->
+        <div class="card" style="min-height: 500px; display: flex; flex-direction: column;">
+          <div class="card-title">🔍 Causal Event History & Audit Log</div>
+          
+          <div style="display: flex; gap: 12px; margin-bottom: 16px;">
+            <input type="number" id="input-audit-order-id" class="form-input" placeholder="Enter Order ID" style="flex: 1;">
+            <button class="btn" id="btn-fetch-audit" style="width: auto; padding: 0 20px;">Fetch History</button>
+          </div>
+          
+          <div class="event-viewer-container" id="audit-log-container" style="flex: 1; overflow-y: auto;">
+            <div class="placeholder-view" style="height: 100%;">
+              <div class="placeholder-icon">📋</div>
+              <p>Enter an Order ID to retrieve its full history log from MongoDB</p>
+            </div>
+          </div>
+        </div>
+        
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let socket = null;
+
+    document.addEventListener('DOMContentLoaded', async () => {
+      const user = getCurrentUser();
+      if (!user || (user.role !== 'manager' && user.role !== 'admin')) {
+        document.getElementById('login-panel').style.display = 'flex';
+      } else {
+        document.getElementById('main-view').style.display = 'block';
+        setupHeader('header-container', 'Management & Resolution Center');
+        initAdmin();
+      }
+
+      // Login handler
+      document.getElementById('login-submit').addEventListener('click', async () => {
+        const pin = document.getElementById('login-pin').value;
+        const credential = document.getElementById('login-name').value;
+        const payload = { pin };
+        
+        if (!isNaN(Number(credential))) {
+          payload.user_id = Number(credential);
+        } else {
+          payload.name = credential;
+        }
+
+        try {
+          const res = await fetch('/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.error || 'Login failed');
+          }
+          const data = await res.json();
+          setAuthToken(data.token);
+          window.location.reload();
+        } catch (e) {
+          const errDiv = document.getElementById('login-error');
+          errDiv.innerText = e.message;
+          errDiv.style.display = 'block';
+        }
+      });
+    });
+
+    async function initAdmin() {
+      // Connect socket
+      const token = getAuthToken();
+      socket = io({ auth: { token } });
+
+      socket.on('connect', () => {
+        console.log('Admin socket connected');
+        socket.emit('join_kitchen'); // Manager joins kitchen updates as well
+      });
+
+      socket.on('order:updated', (updatedOrder) => {
+        console.log('Admin socket update received:', updatedOrder);
+        // Refresh conflicts lists automatically
+        loadConflicts();
+      });
+
+      await loadConflicts();
+
+      document.getElementById('btn-fetch-audit').addEventListener('click', async () => {
+        const orderId = document.getElementById('input-audit-order-id').value;
+        if (!orderId) return;
+        await loadAuditTrail(orderId);
+      });
+    }
+
+    async function loadConflicts() {
+      try {
+        const res = await apiFetch('/sync/conflicts');
+        const conflicts = await res.json();
+        renderConflicts(conflicts);
+      } catch (e) {
+        console.error('Failed to load conflicts list', e);
+      }
+    }
+
+    function renderConflicts(conflicts) {
+      const container = document.getElementById('conflicts-list-container');
+      const countBadge = document.getElementById('conflict-count-badge');
+      container.innerHTML = '';
+      
+      if (!conflicts || conflicts.length === 0) {
+        countBadge.innerText = '0';
+        container.innerHTML = `
+          <div class="placeholder-view" style="height: 250px;">
+            <div class="placeholder-icon">🛡️</div>
+            <h3 style="color: var(--success);">All clean! No conflicts.</h3>
+            <p style="font-size: 13px; margin-top: 4px;">Restaurant synchronization is completely healthy.</p>
+          </div>
+        `;
+        return;
+      }
+      
+      countBadge.innerText = conflicts.length;
+      
+      conflicts.forEach(conflict => {
+        const div = document.createElement('div');
+        div.style.background = 'rgba(239, 68, 68, 0.05)';
+        div.style.border = '1px solid rgba(239, 68, 68, 0.2)';
+        div.style.borderRadius = '12px';
+        div.style.padding = '18px';
+        div.style.marginBottom = '12px';
+        div.style.display = 'flex';
+        div.style.flexDirection = 'column';
+        div.style.gap = '8px';
+        
+        div.innerHTML = `
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-weight: 700; color: var(--danger);">Order #${conflict.order_id}</span>
+            <span style="font-size: 11px; color: var(--text-muted); font-family: monospace;">HLC: ${conflict.hlc}</span>
+          </div>
+          <div style="font-size: 14px;">
+            <strong>Action Attempted:</strong> <span class="event-action-badge">${conflict.action}</span> by Waiter #${conflict.user_id}
+          </div>
+          <div class="conflict-detail-box" style="margin-top: 4px;">
+            Based on Head: ${conflict.based_on_event_id}
+            Payload: ${JSON.stringify(conflict.payload)}
+          </div>
+          <div style="display: flex; gap: 10px; margin-top: 10px;">
+            <button class="btn btn-success" style="padding: 8px 16px; font-size: 13px;" onclick="resolveConflict('${conflict.event_id}', 'accept')">
+              Accept (Force Apply)
+            </button>
+            <button class="btn btn-danger" style="padding: 8px 16px; font-size: 13px;" onclick="resolveConflict('${conflict.event_id}', 'reject')">
+              Reject (Keep Current)
+            </button>
+          </div>
+        `;
+        container.appendChild(div);
+      });
+    }
+
+    async function resolveConflict(eventId, action) {
+      if (!confirm(`Are you sure you want to ${action} this conflict transaction?`)) return;
+      try {
+        const res = await apiFetch('/sync/resolve', {
+          method: 'POST',
+          body: JSON.stringify({ event_id: eventId, action })
+        });
+        const data = await res.json();
+        console.log('Admin resolve conflict response:', data);
+        showToast('Resolution Applied', `Conflict successfully resolved with: ${action}`);
+        await loadConflicts();
+      } catch (e) {
+        console.error('Failed to resolve conflict', e);
+        alert(e.message);
+      }
+    }
+
+    async function loadAuditTrail(orderId) {
+      const container = document.getElementById('audit-log-container');
+      container.innerHTML = '<div class="placeholder-view" style="height: 100%;"><p>Loading historical audit trail...</p></div>';
+      
+      try {
+        const res = await apiFetch(`/events/order/${orderId}`);
+        if (!res.ok) {
+          throw new Error('Order not found or no sync history exists.');
+        }
+        const events = await res.json();
+        renderAuditTrail(events);
+      } catch (e) {
+        container.innerHTML = `
+          <div class="placeholder-view" style="height: 100%; color: var(--danger);">
+            <div class="placeholder-icon">❌</div>
+            <p>${e.message}</p>
+          </div>
+        `;
+      }
+    }
+
+    function renderAuditTrail(events) {
+      const container = document.getElementById('audit-log-container');
+      container.innerHTML = '';
+      
+      if (!events || events.length === 0) {
+        container.innerHTML = '<div class="placeholder-view" style="height: 100%;"><p>No Mongo events recorded for this Order ID.</p></div>';
+        return;
+      }
+      
+      events.forEach((event, index) => {
+        const dateStr = new Date(event.server_received_at).toLocaleTimeString();
+        let statusColor = 'var(--text-muted)';
+        
+        if (event.sync_status === 'applied') statusColor = 'var(--success)';
+        else if (event.sync_status === 'soft_conflict') statusColor = 'var(--warning)';
+        else if (event.sync_status === 'hard_conflict') statusColor = 'var(--danger)';
+        else if (event.sync_status === 'error') statusColor = 'var(--danger)';
+        else if (event.sync_status === 'rejected') statusColor = 'var(--text-muted)';
+        
+        const line = document.createElement('div');
+        line.className = 'event-line';
+        line.innerHTML = `
+          <div class="event-meta">
+            <span>#${index + 1} | ID: ${event.event_id}</span> | 
+            <span>Server Time: ${dateStr}</span>
+          </div>
+          <div class="event-details">
+            <div>
+              <strong>Action:</strong> <span class="event-action-badge">${event.action}</span>
+              by User #${event.user_id} (${event.device_id})
+            </div>
+            <div>
+              Status: <span style="font-weight: 600; color: ${statusColor};">${event.sync_status.toUpperCase()}</span>
+            </div>
+          </div>
+          <div style="margin-top: 4px; font-size: 12px; color: var(--text-muted);">
+            <div>Based On: <span style="font-family: monospace;">${event.based_on_event_id || 'none'}</span></div>
+            <div>HLC: <span style="font-family: monospace;">${event.hlc}</span></div>
+            ${event.conflict_with && event.conflict_with.length > 0 ? `<div style="color: var(--danger);">Conflict References: ${event.conflict_with.join(', ')}</div>` : ''}
+            ${event.resolution ? `<div style="color: var(--info); font-weight: 500;">Resolution: ${JSON.stringify(event.resolution)}</div>` : ''}
+            <details style="margin-top: 4px;">
+              <summary style="cursor: pointer; font-size: 11px;">View Payload</summary>
+              <pre style="background: rgba(0,0,0,0.2); padding: 8px; border-radius: 6px; margin-top: 4px; font-size: 11px;">${JSON.stringify(event.payload, null, 2)}</pre>
+            </details>
+          </div>
+        `;
+        container.appendChild(line);
+      });
+    }
+  </script>
+</body>
+</html>

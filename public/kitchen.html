@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>KOT POS - Kitchen Display System</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="shared.js"></script>
+</head>
+<body>
+
+  <!-- Login Panel -->
+  <div id="login-panel" class="login-container" style="display: none;">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="login-logo">KOT KITCHEN</div>
+        <div class="login-subtitle">Kitchen Display Authentication</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Name or User ID</label>
+        <input type="text" id="login-name" class="form-input" placeholder="e.g. Vikram Singh or 3">
+      </div>
+      <div class="form-group">
+        <label class="form-label">PIN</label>
+        <input type="password" id="login-pin" class="form-input" placeholder="••••">
+      </div>
+      <button class="btn" id="login-submit">Authenticate</button>
+      <div id="login-error" style="color: var(--danger); font-size: 14px; margin-top: 12px; display: none;"></div>
+    </div>
+  </div>
+
+  <!-- Main View -->
+  <div id="main-view" style="display: none;">
+    <div id="header-container"></div>
+    
+    <div class="content-area" style="padding: 24px;">
+      <h2 style="margin-bottom: 24px; display: flex; align-items: center; gap: 12px;">
+        🍳 Active Kitchen Orders
+        <span style="font-size: 13px; font-weight: 500; opacity: 0.6; background: rgba(255, 255, 255, 0.08); padding: 4px 10px; border-radius: 20px;">
+          Live Connection Active
+        </span>
+      </h2>
+      
+      <div class="kitchen-grid" id="kitchen-items-container">
+        <!-- Filled dynamically -->
+      </div>
+      
+      <div class="placeholder-view" id="empty-kitchen-placeholder" style="display: none; height: 300px;">
+        <div class="placeholder-icon">✔️</div>
+        <h2>All clear! No active items.</h2>
+        <p style="margin-top: 8px;">Order items marked 'sent_to_kitchen' will appear here in real time.</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let socket = null;
+
+    document.addEventListener('DOMContentLoaded', async () => {
+      const user = getCurrentUser();
+      // Allow kitchen, manager or admin roles
+      if (!user || (user.role !== 'kitchen' && user.role !== 'manager' && user.role !== 'admin')) {
+        document.getElementById('login-panel').style.display = 'flex';
+      } else {
+        document.getElementById('main-view').style.display = 'block';
+        setupHeader('header-container', 'Kitchen Display System');
+        initKitchen();
+      }
+
+      // Login handler
+      document.getElementById('login-submit').addEventListener('click', async () => {
+        const pin = document.getElementById('login-pin').value;
+        const credential = document.getElementById('login-name').value;
+        const payload = { pin };
+        
+        if (!isNaN(Number(credential))) {
+          payload.user_id = Number(credential);
+        } else {
+          payload.name = credential;
+        }
+
+        try {
+          const res = await fetch('/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.error || 'Login failed');
+          }
+          const data = await res.json();
+          setAuthToken(data.token);
+          window.location.reload();
+        } catch (e) {
+          const errDiv = document.getElementById('login-error');
+          errDiv.innerText = e.message;
+          errDiv.style.display = 'block';
+        }
+      });
+    });
+
+    async function initKitchen() {
+      // Connect socket
+      const token = getAuthToken();
+      socket = io({ auth: { token } });
+
+      socket.on('connect', () => {
+        console.log('Kitchen connected to live sockets');
+        // Join kitchen room
+        socket.emit('join_kitchen');
+      });
+
+      socket.on('order:updated', (updatedOrder) => {
+        console.log('Kitchen received live update from table room:', updatedOrder);
+        // Refresh kitchen items
+        loadKitchenItems();
+      });
+
+      await loadKitchenItems();
+    }
+
+    async function loadKitchenItems() {
+      try {
+        const res = await apiFetch('/kitchen/items');
+        const items = await res.json();
+        renderKitchenItems(items);
+      } catch (e) {
+        console.error('Failed to load kitchen items', e);
+      }
+    }
+
+    function renderKitchenItems(items) {
+      const container = document.getElementById('kitchen-items-container');
+      const placeholder = document.getElementById('empty-kitchen-placeholder');
+      container.innerHTML = '';
+      
+      if (!items || items.length === 0) {
+        placeholder.style.display = 'flex';
+        return;
+      }
+      
+      placeholder.style.display = 'none';
+      
+      items.forEach(item => {
+        const elapsedMinutes = Math.floor((Date.now() - new Date(item.updated_at).getTime()) / 60000);
+        const elapsedText = elapsedMinutes > 0 ? `${elapsedMinutes}m ago` : 'just now';
+        
+        // Progress status details
+        let nextStatus = '';
+        let buttonText = '';
+        let buttonClass = 'btn-success';
+        
+        if (item.status === 'sent_to_kitchen') {
+          nextStatus = 'preparing';
+          buttonText = 'Start Preparing';
+          buttonClass = 'btn';
+        } else if (item.status === 'preparing') {
+          nextStatus = 'ready';
+          buttonText = 'Mark Ready';
+          buttonClass = 'btn-success';
+        }
+        
+        const card = document.createElement('div');
+        card.className = 'kitchen-card';
+        card.innerHTML = `
+          <div class="kitchen-card-header">
+            <span class="kitchen-table-num">Table ${item.order.table.number}</span>
+            <span class="kitchen-time">${elapsedText}</span>
+          </div>
+          <div class="kitchen-item-details">
+            <div class="kitchen-item-name">${item.menu_item.name} <span style="font-size: 14px; opacity: 0.7;">(x${item.qty})</span></div>
+            <div class="kitchen-item-notes">${item.notes || ''}</div>
+          </div>
+          <div style="display: flex; gap: 8px; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); padding-top: 14px;">
+            <span class="item-status-badge badge-${item.status}">${item.status.replace(/_/g, ' ')}</span>
+            <button class="btn ${buttonClass}" style="width: auto; padding: 8px 16px; font-size: 13px;" onclick="advanceItemStatus(${item.order_id}, ${item.id}, '${nextStatus}')">
+              ${buttonText}
+            </button>
+          </div>
+        `;
+        
+        container.appendChild(card);
+      });
+    }
+
+    async function advanceItemStatus(orderId, itemId, status) {
+      try {
+        const res = await apiFetch(`/orders/${orderId}/items/${itemId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status })
+        });
+        
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'Failed to update item status');
+        }
+        
+        showToast('Status Updated', `Item advanced successfully to status: ${status}`);
+        await loadKitchenItems();
+      } catch (e) {
+        console.error('Failed to advance item status', e);
+        alert(e.message);
+      }
+    }
+  </script>
+</body>
+</html>

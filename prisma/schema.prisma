@@ -1,0 +1,120 @@
+// versioned migrations and generated type-safe client reduce boilerplate for the sync/event layer built in later steps.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum TableStatus {
+  available
+  occupied
+  needs_cleaning
+}
+
+enum UserRole {
+  waiter
+  kitchen
+  manager
+  admin
+}
+
+enum OrderStatus {
+  open
+  sent
+  preparing
+  ready
+  served
+  paid
+  cancelled
+}
+
+enum OrderItemStatus {
+  pending
+  sent_to_kitchen
+  preparing
+  ready
+  served
+  cancelled
+}
+
+model Restaurant {
+  id         Int        @id @default(autoincrement())
+  name       String
+  created_at DateTime   @default(now())
+  tables     Table[]
+  menu_items MenuItem[]
+  users      User[]
+  orders     Order[]
+
+  @@map("restaurants")
+}
+
+model Table {
+  id            Int         @id @default(autoincrement())
+  restaurant_id Int
+  restaurant    Restaurant  @relation(fields: [restaurant_id], references: [id])
+  number        Int
+  status        TableStatus
+  orders        Order[]
+
+  @@map("tables")
+}
+
+model MenuItem {
+  id            Int         @id @default(autoincrement())
+  restaurant_id Int
+  restaurant    Restaurant  @relation(fields: [restaurant_id], references: [id])
+  name          String
+  price_cents   Int
+  category      String
+  is_available  Boolean     @default(true)
+  order_items   OrderItem[]
+
+  @@map("menu_items")
+}
+
+model User {
+  id            Int        @id @default(autoincrement())
+  restaurant_id Int
+  restaurant    Restaurant @relation(fields: [restaurant_id], references: [id])
+  name          String
+  role          UserRole
+  pin_hash      String
+
+  @@map("users")
+}
+
+model Order {
+  id            Int         @id @default(autoincrement())
+  restaurant_id Int
+  restaurant    Restaurant  @relation(fields: [restaurant_id], references: [id])
+  table_id      Int
+  table         Table       @relation(fields: [table_id], references: [id])
+  status        OrderStatus
+  created_by    Int
+  created_at    DateTime    @default(now())
+  updated_at    DateTime    @updatedAt
+  head_event_id String?
+  order_items   OrderItem[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id           Int             @id @default(autoincrement())
+  order_id     Int
+  order        Order           @relation(fields: [order_id], references: [id])
+  menu_item_id Int
+  menu_item    MenuItem        @relation(fields: [menu_item_id], references: [id])
+  qty          Int
+  status       OrderItemStatus
+  notes        String?
+  created_by   Int
+  updated_at   DateTime        @updatedAt
+
+  @@map("order_items")
+}
